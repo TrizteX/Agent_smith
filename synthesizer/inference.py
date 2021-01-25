@@ -1,7 +1,7 @@
 from synthesizer.tacotron2 import Tacotron2
 from synthesizer.hparams import hparams
-from multiprocess.pool import Pool  # You're free to use either one
-#from multiprocessing import Pool   # 
+# from multiprocess.pool import Pool  # You're free to use either one
+from multiprocessing import Pool   # 
 from multiprocess.context import SpawnContext
 from synthesizer import audio
 from pathlib import Path
