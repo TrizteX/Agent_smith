@@ -4,10 +4,6 @@ import torch.nn.functional as F
 from vocoder.distribution import sample_from_discretized_mix_logistic
 from vocoder.display import *
 from vocoder.audio import *
-import os
-import numpy as np
-from pathlib import Path
-from typing import Union
 
 
 class ResBlock(nn.Module):
@@ -96,15 +92,12 @@ class WaveRNN(nn.Module):
         super().__init__()
         self.mode = mode
         self.pad = pad
-        if self.mode == 'RAW':
+        if self.mode == 'RAW' :
             self.n_classes = 2 ** bits
-        elif self.mode == 'MOL':
+        elif self.mode == 'MOL' :
             self.n_classes = 30
-        else:
+        else :
             RuntimeError("Unknown model mode value - ", self.mode)
-
-        # List of rnns to call `flatten_parameters()` on
-        self._to_flatten = []
 
         self.rnn_dims = rnn_dims
         self.aux_dims = res_out_dims // 4
@@ -113,33 +106,24 @@ class WaveRNN(nn.Module):
 
         self.upsample = UpsampleNetwork(feat_dims, upsample_factors, compute_dims, res_blocks, res_out_dims, pad)
         self.I = nn.Linear(feat_dims + self.aux_dims + 1, rnn_dims)
-
         self.rnn1 = nn.GRU(rnn_dims, rnn_dims, batch_first=True)
         self.rnn2 = nn.GRU(rnn_dims + self.aux_dims, rnn_dims, batch_first=True)
-        self._to_flatten += [self.rnn1, self.rnn2]
-
         self.fc1 = nn.Linear(rnn_dims + self.aux_dims, fc_dims)
         self.fc2 = nn.Linear(fc_dims + self.aux_dims, fc_dims)
         self.fc3 = nn.Linear(fc_dims, self.n_classes)
 
-        self.register_buffer('step', torch.zeros(1, dtype=torch.long))
+        self.step = nn.Parameter(torch.zeros(1).long(), requires_grad=False)
         self.num_params()
 
-        # Avoid fragmentation of RNN parameters and associated warning
-        self._flatten_parameters()
-
     def forward(self, x, mels):
-        device = next(self.parameters()).device  # use same device as parameters
-
-        # Although we `_flatten_parameters()` on init, when using DataParallel
-        # the model gets replicated, making it no longer guaranteed that the
-        # weights are contiguous in GPU memory. Hence, we must call it again
-        self._flatten_parameters()
-
         self.step += 1
         bsize = x.size(0)
-        h1 = torch.zeros(1, bsize, self.rnn_dims, device=device)
-        h2 = torch.zeros(1, bsize, self.rnn_dims, device=device)
+        if torch.cuda.is_available():
+            h1 = torch.zeros(1, bsize, self.rnn_dims).cuda()
+            h2 = torch.zeros(1, bsize, self.rnn_dims).cuda()
+        else:
+            h1 = torch.zeros(1, bsize, self.rnn_dims).cpu()
+            h2 = torch.zeros(1, bsize, self.rnn_dims).cpu()
         mels, aux = self.upsample(mels)
 
         aux_idx = [self.aux_dims * i for i in range(5)]
@@ -166,21 +150,21 @@ class WaveRNN(nn.Module):
         x = F.relu(self.fc2(x))
         return self.fc3(x)
 
-    def generate(self, mels, save_path: Union[str, Path], batched, target, overlap, mu_law):
-        self.eval()
-
-        device = next(self.parameters()).device  # use same device as parameters
-
+    def generate(self, mels, batched, target, overlap, mu_law, progress_callback=None):
         mu_law = mu_law if self.mode == 'RAW' else False
+        progress_callback = progress_callback or self.gen_display
 
+        self.eval()
         output = []
         start = time.time()
         rnn1 = self.get_gru_cell(self.rnn1)
         rnn2 = self.get_gru_cell(self.rnn2)
 
         with torch.no_grad():
-
-            mels = torch.as_tensor(mels, device=device)
+            if torch.cuda.is_available():
+                mels = mels.cuda()
+            else:
+                mels = mels.cpu()
             wave_len = (mels.size(-1) - 1) * self.hop_length
             mels = self.pad_tensor(mels.transpose(1, 2), pad=self.pad, side='both')
             mels, aux = self.upsample(mels.transpose(1, 2))
@@ -191,9 +175,14 @@ class WaveRNN(nn.Module):
 
             b_size, seq_len, _ = mels.size()
 
-            h1 = torch.zeros(b_size, self.rnn_dims, device=device)
-            h2 = torch.zeros(b_size, self.rnn_dims, device=device)
-            x = torch.zeros(b_size, 1, device=device)
+            if torch.cuda.is_available():
+                h1 = torch.zeros(b_size, self.rnn_dims).cuda()
+                h2 = torch.zeros(b_size, self.rnn_dims).cuda()
+                x = torch.zeros(b_size, 1).cuda()
+            else:
+                h1 = torch.zeros(b_size, self.rnn_dims).cpu()
+                h2 = torch.zeros(b_size, self.rnn_dims).cpu()
+                x = torch.zeros(b_size, 1).cpu()
 
             d = self.aux_dims
             aux_split = [aux[:, :, d * i:d * (i + 1)] for i in range(4)]
@@ -202,8 +191,7 @@ class WaveRNN(nn.Module):
 
                 m_t = mels[:, i, :]
 
-                a1_t, a2_t, a3_t, a4_t = \
-                    (a[:, i, :] for a in aux_split)
+                a1_t, a2_t, a3_t, a4_t = (a[:, i, :] for a in aux_split)
 
                 x = torch.cat([x, m_t, a1_t], dim=1)
                 x = self.I(x)
@@ -225,10 +213,13 @@ class WaveRNN(nn.Module):
                 if self.mode == 'MOL':
                     sample = sample_from_discretized_mix_logistic(logits.unsqueeze(0).transpose(1, 2))
                     output.append(sample.view(-1))
-                    # x = torch.FloatTensor([[sample]]).cuda()
-                    x = sample.transpose(0, 1)
+                    if torch.cuda.is_available():
+                        # x = torch.FloatTensor([[sample]]).cuda()
+                        x = sample.transpose(0, 1).cuda()
+                    else:
+                        x = sample.transpose(0, 1)
 
-                elif self.mode == 'RAW':
+                elif self.mode == 'RAW' :
                     posterior = F.softmax(logits, dim=1)
                     distrib = torch.distributions.Categorical(posterior)
 
@@ -238,34 +229,35 @@ class WaveRNN(nn.Module):
                 else:
                     raise RuntimeError("Unknown model mode value - ", self.mode)
 
-                if i % 100 == 0: self.gen_display(i, seq_len, b_size, start)
+                if i % 100 == 0:
+                    gen_rate = (i + 1) / (time.time() - start) * b_size / 1000
+                    progress_callback(i, seq_len, b_size, gen_rate)
 
         output = torch.stack(output).transpose(0, 1)
         output = output.cpu().numpy()
         output = output.astype(np.float64)
-
-        if mu_law:
-            output = decode_mu_law(output, self.n_classes, False)
-
+        
         if batched:
             output = self.xfade_and_unfold(output, target, overlap)
         else:
             output = output[0]
 
+        if mu_law:
+            output = decode_mu_law(output, self.n_classes, False)
+        if hp.apply_preemphasis:
+            output = de_emphasis(output)
+
         # Fade-out at the end to avoid signal cutting out suddenly
         fade_out = np.linspace(1, 0, 20 * self.hop_length)
         output = output[:wave_len]
         output[-20 * self.hop_length:] *= fade_out
-
-        save_wav(output, save_path)
-
+        
         self.train()
 
         return output
 
 
-    def gen_display(self, i, seq_len, b_size, start):
-        gen_rate = (i + 1) / (time.time() - start) * b_size / 1000
+    def gen_display(self, i, seq_len, b_size, gen_rate):
         pbar = progbar(i, seq_len)
         msg = f'| {pbar} {i*b_size}/{seq_len*b_size} | Batch Size: {b_size} | Gen Rate: {gen_rate:.1f}kHz | '
         stream(msg)
@@ -283,7 +275,10 @@ class WaveRNN(nn.Module):
         # i.e., it won't generalise to other shapes/dims
         b, t, c = x.size()
         total = t + 2 * pad if side == 'both' else t + pad
-        padded = torch.zeros(b, total, c, device=x.device)
+        if torch.cuda.is_available():
+            padded = torch.zeros(b, total, c).cuda()
+        else:
+            padded = torch.zeros(b, total, c).cpu()
         if side == 'before' or side == 'both':
             padded[:, pad:pad + t, :] = x
         elif side == 'after':
@@ -294,17 +289,23 @@ class WaveRNN(nn.Module):
 
         ''' Fold the tensor with overlap for quick batched inference.
             Overlap will be used for crossfading in xfade_and_unfold()
+
         Args:
             x (tensor)    : Upsampled conditioning features.
                             shape=(1, timesteps, features)
             target (int)  : Target timesteps for each index of batch
             overlap (int) : Timesteps for both xfade and rnn warmup
+
         Return:
             (tensor) : shape=(num_folds, target + 2 * overlap, features)
+
         Details:
             x = [[h1, h2, ... hn]]
+
             Where each h is a vector of conditioning features
+
             Eg: target=2, overlap=1 with x.size(1)=10
+
             folded = [[h1, h2, h3, h4],
                       [h4, h5, h6, h7],
                       [h7, h8, h9, h10]]
@@ -323,7 +324,10 @@ class WaveRNN(nn.Module):
             padding = target + 2 * overlap - remaining
             x = self.pad_tensor(x, padding, side='after')
 
-        folded = torch.zeros(num_folds, target + 2 * overlap, features, device=x.device)
+        if torch.cuda.is_available():
+            folded = torch.zeros(num_folds, target + 2 * overlap, features).cuda()
+        else:
+            folded = torch.zeros(num_folds, target + 2 * overlap, features).cpu()
 
         # Get the values for the folded tensor
         for i in range(num_folds):
@@ -336,25 +340,33 @@ class WaveRNN(nn.Module):
     def xfade_and_unfold(self, y, target, overlap):
 
         ''' Applies a crossfade and unfolds into a 1d array.
+
         Args:
             y (ndarry)    : Batched sequences of audio samples
                             shape=(num_folds, target + 2 * overlap)
                             dtype=np.float64
             overlap (int) : Timesteps for both xfade and rnn warmup
+
         Return:
             (ndarry) : audio samples in a 1d array
                        shape=(total_len)
                        dtype=np.float64
+
         Details:
             y = [[seq1],
                  [seq2],
                  [seq3]]
+
             Apply a gain envelope at both ends of the sequences
+
             y = [[seq1_in, seq1_target, seq1_out],
                  [seq2_in, seq2_target, seq2_out],
                  [seq3_in, seq3_target, seq3_out]]
+
             Stagger and add up the groups of samples:
+
             [seq1_in, seq1_target, (seq1_out + seq2_in), seq2_target, ...]
+
         '''
 
         num_folds, length = y.shape
@@ -365,7 +377,6 @@ class WaveRNN(nn.Module):
         silence_len = overlap // 2
         fade_len = overlap - silence_len
         silence = np.zeros((silence_len), dtype=np.float64)
-        linear = np.ones((silence_len), dtype=np.float64)
 
         # Equal power crossfade
         t = np.linspace(-1, 1, fade_len, dtype=np.float64)
@@ -374,7 +385,7 @@ class WaveRNN(nn.Module):
 
         # Concat the silence to the fades
         fade_in = np.concatenate([silence, fade_in])
-        fade_out = np.concatenate([linear, fade_out])
+        fade_out = np.concatenate([fade_out, silence])
 
         # Apply the gain to the overlap samples
         y[:, :overlap] *= fade_in
@@ -390,32 +401,34 @@ class WaveRNN(nn.Module):
 
         return unfolded
 
-    def get_step(self):
+    def get_step(self) :
         return self.step.data.item()
 
-    def log(self, path, msg):
+    def checkpoint(self, model_dir, optimizer) :
+        k_steps = self.get_step() // 1000
+        self.save(model_dir.joinpath("checkpoint_%dk_steps.pt" % k_steps), optimizer)
+
+    def log(self, path, msg) :
         with open(path, 'a') as f:
             print(msg, file=f)
 
-    def load(self, path: Union[str, Path]):
-        # Use device of model params as location for loaded state
-        device = next(self.parameters()).device
-        self.load_state_dict(torch.load(path, map_location=device), strict=False)
+    def load(self, path, optimizer) :
+        checkpoint = torch.load(path)
+        if "optimizer_state" in checkpoint:
+            self.load_state_dict(checkpoint["model_state"])
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+        else:
+            # Backwards compatibility
+            self.load_state_dict(checkpoint)
 
-    def save(self, path: Union[str, Path]):
-        # No optimizer argument because saving a model should not include data
-        # only relevant in the training process - it should only be properties
-        # of the model itself. Let caller take care of saving optimzier state.
-        torch.save(self.state_dict(), path)
+    def save(self, path, optimizer) :
+        torch.save({
+            "model_state": self.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+        }, path)
 
     def num_params(self, print_out=True):
         parameters = filter(lambda p: p.requires_grad, self.parameters())
         parameters = sum([np.prod(p.size()) for p in parameters]) / 1_000_000
-        if print_out:
+        if print_out :
             print('Trainable Parameters: %.3fM' % parameters)
-        return parameters
-
-    def _flatten_parameters(self):
-        """Calls `flatten_parameters` on all the rnns used by the WaveRNN. Used
-        to improve efficiency and avoid PyTorch yelling at us."""
-        [m.flatten_parameters() for m in self._to_flatten]
