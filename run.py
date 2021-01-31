@@ -120,11 +120,7 @@ if __name__ == '__main__':
     
     print("All test passed! You can now synthesize speech.\n\n")
     
-    
-    ## Interactive speech generation
-    print("This is a GUI-less example of interface to SV2TTS. The purpose of this script is to "
-          "show how you can interface this project easily with your own. See the source code for "
-          "an explanation of what is happening.\n")
+   
     
     print("Interactive generation loop")
     num_generated = 0
