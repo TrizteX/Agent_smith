@@ -3,6 +3,7 @@
 ## Overview
 This is the pipeline based on [Link](https://arxiv.org/pdf/1806.04558.pdf) paper. It first creates a vector embedding from your voice input using the [encoder](https://arxiv.org/pdf/1710.10467.pdf) model. This vector is used to parameterize the output of the melspectrogram which is generated using the [synthesizer](https://arxiv.org/pdf/1712.05884.pdf) model. The text you provide is used as the input for the mel spectrogram. After the final spectrogram is created a [vocoder](https://arxiv.org/pdf/1802.08435.pdf) model is used to convert it back to .flac sound file.
 
+![Architecture](arch.jpg)
 ## Output
 Check out the output.wav for results
 
